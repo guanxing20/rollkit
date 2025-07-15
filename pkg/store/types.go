@@ -14,13 +14,16 @@ type Store interface {
 	// SetHeight sets the height saved in the Store if it is higher than the existing height.
 	SetHeight(ctx context.Context, height uint64) error
 
-	// SaveBlock saves block along with its seen signature (which will be included in the next block).
+	// SaveBlockData saves block along with its seen signature (which will be included in the next block).
 	SaveBlockData(ctx context.Context, header *types.SignedHeader, data *types.Data, signature *types.Signature) error
 
-	// GetBlock returns block at given height, or error if it's not found in Store.
+	// GetBlockData returns block at given height, or error if it's not found in Store.
 	GetBlockData(ctx context.Context, height uint64) (*types.SignedHeader, *types.Data, error)
 	// GetBlockByHash returns block with given block header hash, or error if it's not found in Store.
 	GetBlockByHash(ctx context.Context, hash []byte) (*types.SignedHeader, *types.Data, error)
+
+	// GetHeader returns the header at the given height or error if it's not found in Store.
+	GetHeader(ctx context.Context, height uint64) (*types.SignedHeader, error)
 
 	// GetSignature returns signature for a block at given height, or error if it's not found in Store.
 	GetSignature(ctx context.Context, height uint64) (*types.Signature, error)

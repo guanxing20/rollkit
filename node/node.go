@@ -3,8 +3,8 @@ package node
 import (
 	"context"
 
-	"cosmossdk.io/log"
 	ds "github.com/ipfs/go-datastore"
+	logging "github.com/ipfs/go-log/v2"
 
 	coreda "github.com/rollkit/rollkit/core/da"
 	coreexecutor "github.com/rollkit/rollkit/core/execution"
@@ -14,6 +14,7 @@ import (
 	"github.com/rollkit/rollkit/pkg/p2p"
 	"github.com/rollkit/rollkit/pkg/service"
 	"github.com/rollkit/rollkit/pkg/signer"
+	"github.com/rollkit/rollkit/types"
 )
 
 // Node is the interface for an application node
@@ -37,7 +38,8 @@ func NewNode(
 	genesis genesis.Genesis,
 	database ds.Batching,
 	metricsProvider MetricsProvider,
-	logger log.Logger,
+	logger logging.EventLogger,
+	signaturePayloadProvider types.SignaturePayloadProvider,
 ) (Node, error) {
 	if conf.Node.Light {
 		return newLightNode(conf, genesis, p2pClient, database, logger)
@@ -55,5 +57,6 @@ func NewNode(
 		da,
 		metricsProvider,
 		logger,
+		signaturePayloadProvider,
 	)
 }

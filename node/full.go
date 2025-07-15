@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"cosmossdk.io/log"
 	ds "github.com/ipfs/go-datastore"
 	ktds "github.com/ipfs/go-datastore/keytransform"
+	logging "github.com/ipfs/go-log/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -29,6 +29,7 @@ import (
 	"github.com/rollkit/rollkit/pkg/signer"
 	"github.com/rollkit/rollkit/pkg/store"
 	rollkitsync "github.com/rollkit/rollkit/pkg/sync"
+	"github.com/rollkit/rollkit/types"
 )
 
 // prefixes used in KV store to separate rollkit data from execution environment data (if the same data base is reused)
@@ -79,7 +80,8 @@ func newFullNode(
 	sequencer coresequencer.Sequencer,
 	da coreda.DA,
 	metricsProvider MetricsProvider,
-	logger log.Logger,
+	logger logging.EventLogger,
+	signaturePayloadProvider types.SignaturePayloadProvider,
 ) (fn *FullNode, err error) {
 	seqMetrics, _ := metricsProvider(genesis.ChainID)
 
@@ -111,6 +113,7 @@ func newFullNode(
 		seqMetrics,
 		nodeConfig.DA.GasPrice,
 		nodeConfig.DA.GasMultiplier,
+		signaturePayloadProvider,
 	)
 	if err != nil {
 		return nil, err
@@ -122,7 +125,7 @@ func newFullNode(
 		sequencer,
 		genesis.ChainID,
 		nodeConfig.Node.BlockTime.Duration,
-		logger.With("module", "Reaper"),
+		logging.Logger("Reaper"), // Get Reaper's own logger
 		mainKV,
 	)
 
@@ -151,9 +154,9 @@ func initHeaderSyncService(
 	nodeConfig config.Config,
 	genesis genesispkg.Genesis,
 	p2pClient *p2p.Client,
-	logger log.Logger,
+	logger logging.EventLogger,
 ) (*rollkitsync.HeaderSyncService, error) {
-	headerSyncService, err := rollkitsync.NewHeaderSyncService(mainKV, nodeConfig, genesis, p2pClient, logger.With("module", "HeaderSyncService"))
+	headerSyncService, err := rollkitsync.NewHeaderSyncService(mainKV, nodeConfig, genesis, p2pClient, logging.Logger("HeaderSyncService"))
 	if err != nil {
 		return nil, fmt.Errorf("error while initializing HeaderSyncService: %w", err)
 	}
@@ -165,9 +168,9 @@ func initDataSyncService(
 	nodeConfig config.Config,
 	genesis genesispkg.Genesis,
 	p2pClient *p2p.Client,
-	logger log.Logger,
+	logger logging.EventLogger,
 ) (*rollkitsync.DataSyncService, error) {
-	dataSyncService, err := rollkitsync.NewDataSyncService(mainKV, nodeConfig, genesis, p2pClient, logger.With("module", "DataSyncService"))
+	dataSyncService, err := rollkitsync.NewDataSyncService(mainKV, nodeConfig, genesis, p2pClient, logging.Logger("DataSyncService"))
 	if err != nil {
 		return nil, fmt.Errorf("error while initializing DataSyncService: %w", err)
 	}
@@ -191,12 +194,13 @@ func initBlockManager(
 	store store.Store,
 	sequencer coresequencer.Sequencer,
 	da coreda.DA,
-	logger log.Logger,
+	logger logging.EventLogger,
 	headerSyncService *rollkitsync.HeaderSyncService,
 	dataSyncService *rollkitsync.DataSyncService,
 	seqMetrics *block.Metrics,
 	gasPrice float64,
 	gasMultiplier float64,
+	signaturePayloadProvider types.SignaturePayloadProvider,
 ) (*block.Manager, error) {
 	logger.Debug("Proposer address", "address", genesis.ProposerAddress)
 
@@ -209,7 +213,7 @@ func initBlockManager(
 		exec,
 		sequencer,
 		da,
-		logger.With("module", "BlockManager"),
+		logging.Logger("BlockManager"), // Get BlockManager's own logger
 		headerSyncService.Store(),
 		dataSyncService.Store(),
 		headerSyncService,
@@ -217,6 +221,7 @@ func initBlockManager(
 		seqMetrics,
 		gasPrice,
 		gasMultiplier,
+		signaturePayloadProvider,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error while initializing BlockManager: %w", err)
@@ -330,7 +335,7 @@ func (n *FullNode) Run(parentCtx context.Context) error {
 	}
 
 	// Start RPC server
-	handler, err := rpcserver.NewServiceHandler(n.Store, n.p2pClient)
+	handler, err := rpcserver.NewServiceHandler(n.Store, n.p2pClient, n.Logger)
 	if err != nil {
 		return fmt.Errorf("error creating RPC handler: %w", err)
 	}
@@ -415,12 +420,6 @@ func (n *FullNode) Run(parentCtx context.Context) error {
 
 	var multiErr error // Use a multierror variable
 
-	// Stop P2P Client
-	err = n.p2pClient.Close()
-	if err != nil {
-		multiErr = errors.Join(multiErr, fmt.Errorf("closing P2P client: %w", err))
-	}
-
 	// Stop Header Sync Service
 	err = n.hSyncService.Stop(shutdownCtx)
 	if err != nil {
@@ -443,6 +442,12 @@ func (n *FullNode) Run(parentCtx context.Context) error {
 		} else {
 			n.Logger.Debug("data sync service stop context ended", "reason", err) // Log cancellation as debug
 		}
+	}
+
+	// Stop P2P Client
+	err = n.p2pClient.Close()
+	if err != nil {
+		multiErr = errors.Join(multiErr, fmt.Errorf("closing P2P client: %w", err))
 	}
 
 	// Shutdown Prometheus Server
@@ -528,12 +533,12 @@ func (n *FullNode) IsRunning() bool {
 }
 
 // SetLogger sets the logger used by node.
-func (n *FullNode) SetLogger(logger log.Logger) {
+func (n *FullNode) SetLogger(logger logging.EventLogger) {
 	n.Logger = logger
 }
 
 // GetLogger returns logger.
-func (n *FullNode) GetLogger() log.Logger {
+func (n *FullNode) GetLogger() logging.EventLogger {
 	return n.Logger
 }
 

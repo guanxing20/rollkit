@@ -2,22 +2,87 @@ package p2p
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"cosmossdk.io/log"
 	"github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
+	logging "github.com/ipfs/go-log/v2"
+	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	mocknet "github.com/libp2p/go-libp2p/p2p/net/mock"
+
 	"github.com/rollkit/rollkit/pkg/config"
 	"github.com/rollkit/rollkit/pkg/p2p/key"
 )
+
+func TestNewClientWithHost(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	// Common setup
+	conf := config.DefaultConfig
+	conf.RootDir = t.TempDir()
+	nodeKey, err := key.LoadOrGenNodeKey(filepath.Join(conf.RootDir, "config", "node_key.json"))
+	require.NoError(err)
+	ds := dssync.MutexWrap(datastore.NewMapDatastore())
+	logger := logging.Logger("test")
+	_ = logging.SetLogLevel("test", "debug")
+	metrics := NopMetrics()
+
+	// Ensure config directory exists for nodeKey loading
+	ClientInitFiles(t, conf.RootDir)
+
+	t.Run("successful client creation with injected host", func(t *testing.T) {
+		// First, create a client to get its expected gater
+		baseClient, err := NewClient(conf, nodeKey, ds, logger, metrics)
+		require.NoError(err)
+		require.NotNil(baseClient)
+
+		mn := mocknet.New()
+		defer mn.Close()
+
+		h, err := libp2p.New(
+			libp2p.Identity(nodeKey.PrivKey),
+			libp2p.ListenAddrs(multiaddr.StringCast("/ip4/127.0.0.1/tcp/0")),
+			libp2p.ConnectionGater(baseClient.ConnectionGater()), // Use the gater from baseClient
+		)
+		require.NoError(err)
+		defer h.Close()
+
+		client, err := NewClientWithHost(conf, nodeKey, ds, logger, metrics, h)
+		assert.NoError(err)
+		assert.NotNil(client)
+		assert.Equal(h, client.Host())
+	})
+
+	t.Run("error when injected host ID does not match node key ID", func(t *testing.T) {
+		mn := mocknet.New()
+		defer mn.Close()
+
+		// Generate a different node key for the host
+		otherNodeKey, err := key.GenerateNodeKey()
+		require.NoError(err)
+
+		h, err := mn.AddPeer(otherNodeKey.PrivKey, multiaddr.StringCast("/ip4/127.0.0.1/tcp/0"))
+		require.NoError(err)
+
+		client, err := NewClientWithHost(conf, nodeKey, ds, logger, metrics, h)
+		assert.Error(err)
+		assert.Nil(client)
+		assert.Contains(err.Error(), "injected host ID")
+		assert.Contains(err.Error(), "does not match node key ID")
+	})
+
+}
 
 func TestClientStartup(t *testing.T) {
 	assert := assert.New(t)
@@ -62,8 +127,10 @@ func TestClientStartup(t *testing.T) {
 
 	for _, testCase := range testCases {
 		t.Run(testCase.desc, func(t *testing.T) {
+			testLogger := logging.Logger(testCase.desc) // Use specific logger for test case
+			_ = logging.SetLogLevel(testCase.desc, "debug")
 			client, err := NewClient(testCase.conf, nodeKey,
-				dssync.MutexWrap(datastore.NewMapDatastore()), log.NewTestLogger(t), NopMetrics())
+				dssync.MutexWrap(datastore.NewMapDatastore()), testLogger, NopMetrics())
 			assert.NoError(err)
 			assert.NotNil(client)
 
@@ -80,7 +147,8 @@ func TestClientStartup(t *testing.T) {
 
 func TestBootstrapping(t *testing.T) {
 	assert := assert.New(t)
-	logger := log.NewTestLogger(t)
+	logger := logging.Logger("TestBootstrapping")
+	_ = logging.SetLogLevel("TestBootstrapping", "debug")
 
 	clients := startTestNetwork(t.Context(), t, 4, map[int]hostDescr{
 		1: {conns: []int{0}},
@@ -101,7 +169,8 @@ func TestBootstrapping(t *testing.T) {
 
 func TestDiscovery(t *testing.T) {
 	assert := assert.New(t)
-	logger := log.NewTestLogger(t)
+	logger := logging.Logger("TestDiscovery")
+	_ = logging.SetLogLevel("TestDiscovery", "debug")
 
 	clients := startTestNetwork(t.Context(), t, 5, map[int]hostDescr{
 		1: {conns: []int{0}, chainID: "ORU2"},
@@ -154,7 +223,8 @@ func TestSeedStringParsing(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			assert := assert.New(t)
 			require := require.New(t)
-			logger := log.NewNopLogger()
+			logger := logging.Logger("TestSeedStringParsing")
+			_ = logging.SetLogLevel("TestSeedStringParsing", "FATAL")
 			tempDir := t.TempDir()
 			ClientInitFiles(t, tempDir)
 
@@ -186,4 +256,140 @@ func ClientInitFiles(t *testing.T, tempDir string) {
 		t.Fatalf("failed to create config directory: %v", err)
 	}
 
+}
+
+// waitForCondition waits for a condition to be true or a timeout to occur.
+// It checks the condition immediately, then polls at a regular interval.
+func waitForCondition(timeout time.Duration, conditionFunc func() bool) error {
+	// Check immediately
+	if conditionFunc() {
+		return nil
+	}
+
+	// Poll
+	ticker := time.NewTicker(100 * time.Millisecond) // Adjust poll interval as needed
+	defer ticker.Stop()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if conditionFunc() {
+				return nil
+			}
+		case <-timer.C:
+			return fmt.Errorf("timed out after %v waiting for condition", timeout)
+		}
+	}
+}
+
+func TestClientInfoMethods(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	logger := logging.Logger("TestClientInfoMethods")
+	_ = logging.SetLogLevel("TestClientInfoMethods", "debug")
+
+	tempDir := t.TempDir()
+	ClientInitFiles(t, tempDir)
+	conf := config.DefaultConfig
+	conf.RootDir = tempDir
+	conf.ChainID = "test-chain"
+
+	mn := mocknet.New()
+	defer mn.Close()
+
+	var clients []*Client
+	var hosts []host.Host
+	var err error
+
+	for i := 0; i < 3; i++ {
+		nodeKey, e := key.GenerateNodeKey()
+		require.NoError(e)
+		h, e := mn.AddPeer(nodeKey.PrivKey, multiaddr.StringCast("/ip4/127.0.0.1/tcp/0"))
+		require.NoError(e)
+		c, e := NewClientWithHost(conf, nodeKey, dssync.MutexWrap(datastore.NewMapDatastore()), logger, NopMetrics(), h)
+		require.NoError(e)
+		clients = append(clients, c)
+		hosts = append(hosts, h)
+		defer c.Close()
+	}
+
+	client0 := clients[0]
+	client1 := clients[1]
+	client2 := clients[2]
+
+	// Link all peers in the mocknet
+	err = mn.LinkAll()
+	require.NoError(err)
+	err = mn.ConnectAllButSelf()
+	require.NoError(err)
+
+	// Start clients
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for _, c := range clients {
+		err = c.Start(ctx)
+		require.NoError(err)
+	}
+
+	// Wait for connections to establish and DHT to settle
+	err = waitForCondition(5*time.Second, func() bool {
+		connectedPeers := client0.Peers()
+		return len(connectedPeers) == 2
+	})
+
+	require.NoError(err)
+	t.Run("GetNetworkInfo", func(t *testing.T) {
+		netInfo, err := client0.GetNetworkInfo()
+		assert.NoError(err)
+		assert.Equal(client0.host.ID().String(), netInfo.ID)
+		assert.Contains(netInfo.ListenAddress[0], hosts[0].Addrs()[0].String()) // Use h0.Addrs()[0].String()
+		assert.ElementsMatch([]peer.ID{client1.host.ID(), client2.host.ID()}, netInfo.ConnectedPeers)
+	})
+
+	t.Run("GetPeers", func(t *testing.T) {
+		peers, err := client0.GetPeers()
+		assert.NoError(err)
+		expectedPeerIDs := []peer.ID{client1.host.ID(), client2.host.ID()}
+		actualPeerIDs := make([]peer.ID, len(peers))
+		for i, p := range peers {
+			actualPeerIDs[i] = p.ID
+		}
+		assert.ElementsMatch(expectedPeerIDs, actualPeerIDs)
+	})
+
+	t.Run("Peers", func(t *testing.T) {
+		connectedPeers := client0.Peers()
+		assert.Len(connectedPeers, 2)
+
+		foundClient1 := false
+		foundClient2 := false
+		for _, p := range connectedPeers {
+			if p.NodeInfo.NodeID == client1.host.ID().String() {
+				foundClient1 = true
+			} else if p.NodeInfo.NodeID == client2.host.ID().String() {
+				foundClient2 = true
+			}
+			assert.Equal(client0.conf.ListenAddress, p.NodeInfo.ListenAddr)
+			assert.Equal(client0.chainID, p.NodeInfo.Network)
+			assert.NotEmpty(p.RemoteIP)
+		}
+		assert.True(foundClient1, "client1 not found in connected peers")
+		assert.True(foundClient2, "client2 not found in connected peers")
+	})
+
+	t.Run("PeerIDs", func(t *testing.T) {
+		peerIDs := client0.PeerIDs()
+		assert.ElementsMatch([]peer.ID{client1.host.ID(), client2.host.ID()}, peerIDs)
+	})
+
+	t.Run("Info", func(t *testing.T) {
+		nodeID, listenAddr, chainID, err := client0.Info()
+		assert.NoError(err)
+		assert.NotEmpty(nodeID)
+		assert.Equal(client0.conf.ListenAddress, listenAddr)
+		assert.Equal(client0.chainID, chainID)
+	})
 }
